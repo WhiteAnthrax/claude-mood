@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Helper for storing and retrieving spinner-verb mood presets in this repo.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO_DIR="$(dirname -- "$SCRIPT_DIR")"
+MOODS_DIR="$REPO_DIR/moods"
+
+usage() {
+  echo "usage: mood-lib <sync|list|show|save|push|status> [args...]" >&2
+  exit 1
+}
+
+require_repo() {
+  if [ ! -d "$REPO_DIR/.git" ]; then
+    echo "error: $REPO_DIR is not a git repository" >&2
+    exit 1
+  fi
+}
+
+# Turns a free-form theme string into a safe filename component.
+# Deny-list approach: strip path separators, control chars, and shell
+# metacharacters, but keep non-ASCII (Japanese, etc.) text intact so
+# slugs stay human-readable.
+sanitize_slug() {
+  local raw="$1" s
+  s=$(printf '%s' "$raw" | tr -d '[:cntrl:]')
+  s=$(printf '%s' "$s" | tr -d '/\\:*?"<>|`$;&(){}[]!^~'"'"'')
+  s=$(printf '%s' "$s" | tr -s '[:space:]' '-')
+  s=$(printf '%s' "$s" | sed -E 's/^[.-]+//; s/[.-]+$//')
+  s=$(printf '%s' "$s" | cut -c1-40)
+  if [ -z "$s" ]; then
+    s="mood-$(date -u +%s)"
+  fi
+  printf '%s' "$s"
+}
+
+# Rejects slugs that could escape the moods/ directory (defensive check
+# for slugs coming back from a caller rather than freshly generated here).
+validate_slug() {
+  local s="$1"
+  case "$s" in
+    ''|*/*|*'\'*) return 1 ;;
+  esac
+  return 0
+}
+
+cmd_sync() {
+  require_repo
+  git -C "$REPO_DIR" pull --ff-only
+}
+
+cmd_list() {
+  shopt -s nullglob
+  local files=("$MOODS_DIR"/*.json)
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "(no saved moods yet)"
+    return 0
+  fi
+  {
+    printf 'slug\ttheme\tmode\tverbs\tcreatedAt\n'
+    for f in "${files[@]}"; do
+      local slug
+      slug=$(basename "$f" .json)
+      jq -r --arg slug "$slug" \
+        '[$slug, .theme, .mode, (.verbs | length | tostring), .createdAt] | @tsv' \
+        "$f"
+    done
+  } | column -t -s $'\t'
+}
+
+cmd_show() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || usage
+  validate_slug "$slug" || { echo "error: invalid slug: $slug" >&2; exit 1; }
+  local file="$MOODS_DIR/$slug.json"
+  if [ ! -f "$file" ]; then
+    echo "error: no such mood: $slug" >&2
+    exit 1
+  fi
+  cat "$file"
+}
+
+cmd_save() {
+  local theme="${1:-}" mode="${2:-}" verbs_file="${3:-}"
+  if [ -z "$theme" ] || [ -z "$mode" ] || [ -z "$verbs_file" ]; then
+    usage
+  fi
+  if [ ! -f "$verbs_file" ]; then
+    echo "error: verbs file not found: $verbs_file" >&2
+    exit 1
+  fi
+  require_repo
+  mkdir -p "$MOODS_DIR"
+
+  local base_slug slug i
+  base_slug=$(sanitize_slug "$theme")
+  slug="$base_slug"
+  i=2
+  while [ -e "$MOODS_DIR/$slug.json" ]; do
+    slug="${base_slug}-${i}"
+    i=$((i + 1))
+  done
+
+  local created_at
+  created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -n \
+    --arg theme "$theme" \
+    --arg mode "$mode" \
+    --arg createdAt "$created_at" \
+    --slurpfile verbs "$verbs_file" \
+    '{theme: $theme, mode: $mode, verbs: $verbs[0], createdAt: $createdAt}' \
+    > "$MOODS_DIR/$slug.json"
+
+  git -C "$REPO_DIR" add "moods/$slug.json"
+  git -C "$REPO_DIR" commit --quiet -m "Add mood: $theme"
+
+  printf '%s\n' "$slug"
+}
+
+cmd_status() {
+  require_repo
+  local ahead
+  ahead=$(git -C "$REPO_DIR" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+  if [ "$ahead" = "0" ]; then
+    echo "up to date, nothing to push"
+  else
+    echo "$ahead unpushed commit(s)"
+  fi
+}
+
+cmd_push() {
+  require_repo
+  if git -C "$REPO_DIR" push; then
+    return 0
+  fi
+  echo "push rejected, retrying after rebase..." >&2
+  if git -C "$REPO_DIR" pull --rebase --autostash && git -C "$REPO_DIR" push; then
+    echo "pushed after rebase"
+    return 0
+  fi
+  echo "error: could not push automatically — run 'mood-lib sync' and resolve manually" >&2
+  exit 1
+}
+
+main() {
+  local sub="${1:-}"
+  [ -n "$sub" ] || usage
+  shift
+  case "$sub" in
+    sync) cmd_sync "$@" ;;
+    list) cmd_list "$@" ;;
+    show) cmd_show "$@" ;;
+    save) cmd_save "$@" ;;
+    push) cmd_push "$@" ;;
+    status) cmd_status "$@" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
