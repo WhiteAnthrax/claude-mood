@@ -7,8 +7,45 @@ REPO_DIR="$(dirname -- "$SCRIPT_DIR")"
 MOODS_DIR="$REPO_DIR/moods"
 
 usage() {
-  echo "usage: mood-lib <sync|list|show|save|push|status> [args...]" >&2
+  echo "usage: mood-lib <sync|list|show|save|sanitize|apply|push|status> [args...]" >&2
   exit 1
+}
+
+# Shared jq defs for cleaning untrusted verb text (web-derived or pulled via
+# git) before it reaches settings.json or the terminal.
+# strip_cp drops C0/C1 controls (ANSI/OSC injection), bidi controls, line
+# separators, invisible chars, TAG chars, and surrogates — but keeps
+# ZWJ/ZWNJ/VS-16 so composed emoji survive. codepoint filtering via
+# explode/implode avoids Oniguruma \u regex portability issues.
+SANITIZE_JQ='
+def strip_cp: explode | map(select(
+    (. >= 32) and (. != 127)
+    and ((. >= 128 and . <= 159) | not)
+    and (IN(8206,8207,1564,8232,8233,8203,8288,65279,173) | not)
+    and ((. >= 8234 and . <= 8238) | not)
+    and ((. >= 8294 and . <= 8297) | not)
+    and ((. >= 917504 and . <= 917631) | not)
+    and ((. >= 55296 and . <= 57343) | not)
+  )) | implode;
+def wtrim: gsub("^[\\s　]+"; "") | gsub("[\\s　]+$"; "");
+def sanitize_verbs:
+  if length != 1 then error("expected exactly one JSON document")
+  elif (.[0] | type) != "array" then error("verbs must be a JSON array of strings")
+  elif (.[0] | all(type == "string") | not) then error("verbs must be a JSON array of strings")
+  elif (.[0] | length) > 2000 then error("too many verbs (safety cap: 2000)")
+  else .[0]
+    | map(strip_cp | wtrim | .[0:1000])
+    | map(select(length > 0))
+    | reduce .[] as $v ([]; if index($v) then . else . + [$v] end)
+  end
+  | if length == 0 then error("no verbs left after sanitizing") else . end;
+'
+
+require_mode() {
+  case "${1:-}" in
+    replace|append) ;;
+    *) echo "error: mode must be 'replace' or 'append'" >&2; exit 1 ;;
+  esac
 }
 
 require_repo() {
@@ -45,6 +82,48 @@ validate_slug() {
   return 0
 }
 
+cmd_sanitize() {
+  local verbs_file="${1:-}"
+  [ -n "$verbs_file" ] || usage
+  if [ ! -f "$verbs_file" ]; then
+    echo "error: verbs file not found: $verbs_file" >&2
+    exit 1
+  fi
+  jq -e -s "$SANITIZE_JQ sanitize_verbs" "$verbs_file"
+}
+
+# Sanitizes verbs and writes them into settings.json's spinnerVerbs, leaving
+# every other key untouched. On any failure settings.json is left as-is.
+cmd_apply() {
+  local mode="${1:-}" verbs_file="${2:-}"
+  [ -n "$verbs_file" ] || usage
+  require_mode "$mode"
+
+  local settings settings_dir clean_tmp out_tmp
+  settings=$(realpath -m "$HOME/.claude/settings.json")
+  settings_dir=$(dirname "$settings")
+  mkdir -p "$settings_dir" "$HOME/.claude/backups"
+  [ -f "$settings" ] || printf '{}\n' > "$settings"
+
+  clean_tmp=$(mktemp)
+  out_tmp=$(mktemp -p "$settings_dir" settings.mood.XXXXXX)
+  # trap fires at script exit, after locals are gone; :- keeps set -u happy
+  trap 'rm -f "${clean_tmp:-}" "${out_tmp:-}"' EXIT
+
+  cmd_sanitize "$verbs_file" > "$clean_tmp"
+  cp "$settings" "$HOME/.claude/backups/settings.json.mood.$(date +%s)"
+
+  jq --arg mode "$mode" --slurpfile v "$clean_tmp" \
+    '.spinnerVerbs = {mode: $mode, verbs: $v[0]}' "$settings" > "$out_tmp"
+
+  jq -e --slurpfile old "$settings" '
+      (del(.spinnerVerbs) == ($old[0] | del(.spinnerVerbs)))
+      and (.spinnerVerbs.verbs | length >= 1)' "$out_tmp" > /dev/null \
+    || { echo "error: post-merge validation failed, settings.json unchanged" >&2; exit 1; }
+  mv "$out_tmp" "$settings"
+  echo "applied $(jq '.spinnerVerbs.verbs | length' "$settings") verbs (mode: $mode)"
+}
+
 cmd_sync() {
   require_repo
   git -C "$REPO_DIR" pull --ff-only
@@ -62,9 +141,13 @@ cmd_list() {
     for f in "${files[@]}"; do
       local slug
       slug=$(basename "$f" .json)
-      jq -r --arg slug "$slug" \
-        '[$slug, .theme, .mode, (.verbs | length | tostring), .createdAt] | @tsv' \
-        "$f"
+      # Files arrive via git pull, so treat their contents as untrusted:
+      # strip control chars before they hit the terminal via @tsv.
+      jq -r --arg slug "$slug" "$SANITIZE_JQ"'
+        [$slug, (.theme | tostring | strip_cp), (.mode | tostring | strip_cp),
+         (.verbs | length | tostring), (.createdAt | tostring | strip_cp)] | @tsv' \
+        "$f" 2>/dev/null \
+        || printf '%s\t(invalid)\t-\t-\t-\n' "$slug"
     done
   } | column -t -s $'\t'
 }
@@ -78,7 +161,13 @@ cmd_show() {
     echo "error: no such mood: $slug" >&2
     exit 1
   fi
-  cat "$file"
+  # Re-emit sanitized rather than cat'ing: the file came from git pull and
+  # jq passes C1 control bytes through raw, so strip everything explicitly.
+  jq -e "$SANITIZE_JQ"'
+    {theme: (.theme | tostring | strip_cp | wtrim),
+     mode:  (if .mode == "append" then "append" else "replace" end),
+     verbs: ([.verbs] | sanitize_verbs)}' "$file" \
+    || { echo "error: invalid mood file: $slug" >&2; exit 1; }
 }
 
 cmd_save() {
@@ -86,12 +175,24 @@ cmd_save() {
   if [ -z "$theme" ] || [ -z "$mode" ] || [ -z "$verbs_file" ]; then
     usage
   fi
+  require_mode "$mode"
   if [ ! -f "$verbs_file" ]; then
     echo "error: verbs file not found: $verbs_file" >&2
     exit 1
   fi
   require_repo
   mkdir -p "$MOODS_DIR"
+
+  # Clean the verbs before they are committed to the shared repo, and the
+  # theme before it lands in the JSON and the commit message.
+  local clean_tmp
+  clean_tmp=$(mktemp)
+  trap 'rm -f "${clean_tmp:-}"' EXIT
+  cmd_sanitize "$verbs_file" > "$clean_tmp"
+  theme=$(jq -rn --arg t "$theme" "$SANITIZE_JQ"' $t | strip_cp | wtrim')
+  if [ -z "$theme" ]; then
+    theme="mood-$(date -u +%s)"
+  fi
 
   local base_slug slug i
   base_slug=$(sanitize_slug "$theme")
@@ -108,7 +209,7 @@ cmd_save() {
     --arg theme "$theme" \
     --arg mode "$mode" \
     --arg createdAt "$created_at" \
-    --slurpfile verbs "$verbs_file" \
+    --slurpfile verbs "$clean_tmp" \
     '{theme: $theme, mode: $mode, verbs: $verbs[0], createdAt: $createdAt}' \
     > "$MOODS_DIR/$slug.json"
 
@@ -152,6 +253,8 @@ main() {
     list) cmd_list "$@" ;;
     show) cmd_show "$@" ;;
     save) cmd_save "$@" ;;
+    sanitize) cmd_sanitize "$@" ;;
+    apply) cmd_apply "$@" ;;
     push) cmd_push "$@" ;;
     status) cmd_status "$@" ;;
     *) usage ;;

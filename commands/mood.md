@@ -38,7 +38,8 @@ allowed-tools: Bash, Read, Write, WebSearch, WebFetch
    - 見つかった場合: 「保存済みの `<theme>` を使いますか?それとも新しく作り
      直しますか?」とユーザーに一言確認する。
      - 「保存済みを使う」→ `"$MOOD_LIB" show <slug>` の出力(`theme`/`mode`/`verbs`)
-       をそのまま手順5の書き込みに使う。手順3・4(生成)はスキップして手順5へ進む。
+       を使う。`verbs` 配列を scratchpad の一時ファイルに Write し、手順5の
+       `apply` に `mode` とともに渡す。手順3・4(生成)はスキップして手順5へ進む。
      - 「新規に作り直す」→ 通常どおり手順3に進む。
    - 明らかに新規で被りがなければ、この確認はせず手順3に進む。
 
@@ -51,7 +52,8 @@ allowed-tools: Bash, Read, Write, WebSearch, WebFetch
    - 「〜っぽく」「〜な気分」のような曖昧指定は、その雰囲気の短いフレーズを創作する。
 
 4. **Spinner Verbs をたくさん** 生成する(既定は 40〜60 個。ユーザーが
-   「もっと」「たくさん」「100個」など多めを望んだらその分だけ増やす。上限は設けない)。
+   「もっと」「たくさん」「100個」など多めを望んだらその分だけ増やす。
+   ただし安全上限として 2000 個まで)。
    - スピナーの語尾には自動で「…」が付くので、各要素は句読点で終わらせない。
    - 元ネタがセリフ/名言ならそのまま引用してよい。
    - 抽象的な気分テーマなら、動作を表す短い動詞句(例: "全集中している")にすると自然。
@@ -65,27 +67,22 @@ allowed-tools: Bash, Read, Write, WebSearch, WebFetch
      - 長文モードでも個数はケチらずたくさん出す(長くても軽いので問題ない)。
      - 例: 名言なら前後の文脈まで含めた長い引用、ネタ系なら定番のコピペ長文など。
 
-5. **既存設定を壊さずに書き込む。** 以下を実行:
-   ```bash
-   # まずバックアップ(新規PCでディレクトリやファイルが無くても失敗しないように)
-   mkdir -p ~/.claude/backups
-   [ -f ~/.claude/settings.json ] || echo '{}' > ~/.claude/settings.json
-   cp ~/.claude/settings.json ~/.claude/backups/settings.json.mood.$(date +%s)
-   ```
+5. **既存設定を壊さずに書き込む。**
    使用する動詞リスト(新規生成 or 保存済みmoodの`verbs`)をすべて JSON 配列として
    一時ファイルに Write ツールで書き出し(パスは `/tmp` ではなくセッションの
-   scratchpad を使う。例: `<scratchpad>/verbs.json`)、jq でマージする:
+   scratchpad を使う。例: `<scratchpad>/verbs.json`)、`apply` で書き込む:
    ```bash
-   jq --slurpfile v <scratchpad>/verbs.json \
-     '.spinnerVerbs = {mode: "replace", verbs: $v[0]}' \
-     ~/.claude/settings.json > ~/.claude/settings.json.tmp \
-     && mv ~/.claude/settings.json.tmp ~/.claude/settings.json
+   "$MOOD_LIB" apply replace <scratchpad>/verbs.json
    ```
-   - デフォルトの動詞も残したい、と明示された場合のみ `mode` を `"append"` にする。
-     通常は `"replace"`。
-   - jq が settings.json を壊さなかったか、書き込み後に
-     `jq -e '.spinnerVerbs.verbs | length >= 40' ~/.claude/settings.json` で検証する
-     (ユーザー指定の個数がある場合はその数以上か確認)。
+   - `apply` はサニタイズ(制御文字等の除去)・バックアップ・`spinnerVerbs` 以外の
+     キーが変わっていないことの検証まで一括で行う。バックアップや jq マージを
+     自前で行わないこと。
+   - デフォルトの動詞も残したい、と明示された場合のみ `apply append` にする。
+     通常は `apply replace`。
+   - **`apply` が非ゼロ exit した場合、settings.json は変更されていない。**
+     エラー内容(不正な JSON、サニタイズ後に空 等)をユーザーに報告して中断する。
+   - `apply` は適用した動詞の個数を出力するので、期待した個数以上か確認する
+     (サニタイズで空要素や重複が削られ、多少減ることはある)。
 
 6. **新規生成した場合のみ、ライブラリに保存する。**(保存済みmoodをそのまま
    流用した場合はこの手順は不要)
