@@ -1,5 +1,6 @@
 ---
-description: 気分・テーマを自然言語で指定して Claude Code の Spinner Verbs を書き換える
+description: /mood <テーマ> で、作業中スピナーの文言（spinnerVerbs）をテーマに沿って生成・保存し settings.json に反映する。「スピナーの文言を〇〇風にして」「mood 一覧」と言われたときに使う
+disable-model-invocation: true
 argument-hint: [テーマ] 例) ジョジョの名言 / ジブリ / ネットミーム / 今クールのおすすめアニメ / フリーレン 長めで / 一覧
 allowed-tools: Bash, Read, Write, WebSearch, WebFetch
 ---
